@@ -1,4 +1,4 @@
-name: ImmortalWrt Builder
+name: ImmortalWrt v25.12.1 Builder (Cudy TR3000 512MB)
 
 permissions:
   contents: write
@@ -11,7 +11,7 @@ env:
   CCACHE_MAXSIZE: 6G
   USE_CCACHE: 1
   REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: v24.10.4
+  REPO_BRANCH: v25.12.1
   FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: openwrt-mod/config/minimum.config
   DIY_P1_SH: Actions-OpenWrt/diy-part1.sh
@@ -35,7 +35,7 @@ jobs:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
+        sudo docker image prune --all --force || true
         sudo -E apt-get -qq update
         sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
         sudo -E apt-get -qq autoremove --purge
@@ -43,7 +43,7 @@ jobs:
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
-        echo "💾 Disk space after cleanup:"
+        echo "Disk space after cleanup:"
         df -hT
 
     - name: Clone source code
@@ -57,7 +57,9 @@ jobs:
       run: |
         cd openwrt/target/linux/mediatek/image
         cat $GITHUB_WORKSPACE/openwrt-mod/cudy-tr3000-512.mk >> filogic.mk
-        echo "✅ Custom device definition appended to filogic.mk"
+        echo "[OK] Custom device definition appended to filogic.mk"
+        echo "--- last 15 lines of filogic.mk ---"
+        tail -15 filogic.mk
 
     - name: Copy custom DTS file
       run: |
@@ -69,10 +71,10 @@ jobs:
       uses: actions/cache@v4
       with:
         path: .ccache
-        key: openwrt-ccache-${{ runner.os }}
+        key: openwrt-ccache-${{ runner.os }}-v25
         restore-keys: |
           openwrt-ccache-${{ runner.os }}
-    
+
     - name: Load custom feeds
       run: |
         [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
@@ -94,6 +96,17 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
+    - name: Verify target device is selected
+      run: |
+        cd openwrt
+        echo "=== Selected target devices ==="
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config
+        if ! grep -q 'CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-512mb-v1=y' .config; then
+          echo "[FAIL] cudy_tr3000-512mb-v1 not selected in .config"
+          exit 1
+        fi
+        echo "[OK] cudy_tr3000-512mb-v1 selected"
+
     - name: Download package
       id: package
       run: |
@@ -107,31 +120,28 @@ jobs:
       id: compile
       run: |
         cd openwrt
-        echo "🔨 Starting compilation with $(nproc) threads"
+        echo "Starting compilation with $(nproc) threads"
         echo "CCACHE_DIR: $CCACHE_DIR"
 
-        # 首先尝试多线程编译
         if make -j$(nproc) CC="ccache gcc" CXX="ccache g++"; then
-          echo "✅ Multi-threaded compilation succeeded"
+          echo "[OK] Multi-threaded compilation succeeded"
           echo "status=success" >> $GITHUB_OUTPUT
         else
-          echo "⚠️ Multi-threaded compilation failed, retrying with single thread and verbose output..."
+          echo "[WARN] Multi-threaded compilation failed, retrying with single thread and verbose output..."
           make -j1 V=s
           if [ $? -eq 0 ]; then
-            echo "✅ Single-threaded compilation succeeded"
+            echo "[OK] Single-threaded compilation succeeded"
             echo "status=success" >> $GITHUB_OUTPUT
           else
-            echo "❌ Compilation failed"
+            echo "[FAIL] Compilation failed"
             echo "status=failure" >> $GITHUB_OUTPUT
             exit 1
           fi
         fi
 
-        # 显示 ccache 统计
-        echo "📊 ccache statistics:"
+        echo "ccache statistics:"
         ccache -s
 
-        # 获取设备名称
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
@@ -140,19 +150,11 @@ jobs:
       if: (!cancelled())
       run: df -hT
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: ImmortalWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
-
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
         cd openwrt/bin/targets/*/*
-        # rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -170,49 +172,52 @@ jobs:
         set -e
         cd openwrt/bin/targets/*/*
 
-        # 生成基础信息
         BUILD_TIME=$(date +"%Y%m%d%H%M")
         RELEASE_NAME="immortalwrt-${REPO_BRANCH}-${BUILD_TIME}"
         echo "release_tag=$RELEASE_NAME" >> $GITHUB_OUTPUT
 
-        echo "🧱 Release name: $RELEASE_NAME"
-        echo "📦 Collecting firmware files..."
+        echo "Release name: $RELEASE_NAME"
+        echo "Collecting firmware files..."
 
-        # 筛选固件文件
         FIRMWARE_FILES=$(ls *squashfs-sysupgrade.bin *initramfs-kernel.bin 2>/dev/null || true)
         if [ -z "$FIRMWARE_FILES" ]; then
-          echo "❌ 未找到匹配的固件文件 (*.bin)"
+          echo "[FAIL] No matching firmware files (*.bin) found"
           exit 1
         fi
 
-        # 计算 sha256 校验
-        echo "🔍 Generating SHA256 checksums..."
+        echo "Generating SHA256 checksums..."
         sha256sum $FIRMWARE_FILES > sha256sums.txt
-
-        echo "✅ 固件列表:"
+        echo "Firmware list:"
         cat sha256sums.txt
 
-        # 生成 release note
-        echo "## ImmortalWrt for Cudy TR3000(512MB)" > ${{ github.workspace }}/release.txt
-        echo "- Branch: ${REPO_BRANCH}" >> ${{ github.workspace }}/release.txt
-        echo "- Build time: ${BUILD_TIME}" >> ${{ github.workspace }}/release.txt
-        # echo "" >> ${{ github.workspace }}/release.txt
-        # echo "### SHA256" >> ${{ github.workspace }}/release.txt
-        # cat sha256sums.txt >> ${{ github.workspace }}/release.txt
+        {
+          echo "## ImmortalWrt ${REPO_BRANCH} for Cudy TR3000 (512MB)"
+          echo ""
+          echo "- Branch: \`${REPO_BRANCH}\`"
+          echo "- Device: \`cudy_tr3000-512mb-v1\`"
+          echo "- Build time: \`${BUILD_TIME}\`"
+          echo "- Image size: 520000k"
+          echo "- Default IP: 192.168.1.1"
+          echo ""
+          echo "### Install"
+          echo "1. Install the multi-layout u-boot first (from zhuannn/cudy-tr3000-512 releases)."
+          echo "2. In u-boot choose mtd layout \`mod-490\`."
+          echo "3. Flash \`*squashfs-sysupgrade.bin\` via u-boot or sysupgrade."
+          echo ""
+          echo "### SHA256"
+          echo ""
+          sed 's/^/    /' sha256sums.txt
+        } > ${{ github.workspace }}/release.txt
 
-        # 检查是否需要上传 kmod 包
         if [ "${UPLOAD_KMOD}" = "true" ]; then
-          echo "" >> ${{ github.workspace }}/release.txt
-          echo "🧩 正在打包 kernel modules..."
           if [ -d packages ]; then
             tar -czf kmod.tar.gz packages
-            echo "✅ 已生成 kmod.tar.gz"
+            echo "[OK] Generated kmod.tar.gz"
           else
-            echo "⚠️ 未找到 packages 目录，跳过 kmod 打包"
+            echo "[WARN] packages directory not found, skipping kmod packaging"
           fi
         fi
 
-        # 将路径信息传递出去
         echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
