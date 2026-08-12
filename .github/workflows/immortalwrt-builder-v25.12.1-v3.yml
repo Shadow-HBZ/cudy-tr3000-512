@@ -1,0 +1,382 @@
+name: ImmortalWrt v25.12.1 Builder (v6.1 OOM-fixed, TR3000 512MB)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 6G
+  USE_CCACHE: 1
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: v25.12.1
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: openwrt-mod/config/recommended.config
+  DIY_P1_SH: Actions-OpenWrt/diy-part1.sh
+  DIY_P2_SH: Actions-OpenWrt/diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  UPLOAD_KMOD: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force || true
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        echo "Disk space after cleanup:"
+        df -hT
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Append custom device definition
+      run: |
+        cd openwrt/target/linux/mediatek/image
+        cat $GITHUB_WORKSPACE/openwrt-mod/cudy-tr3000-512.mk >> filogic.mk
+        echo "[OK] Custom device definition appended to filogic.mk"
+        echo "--- last 15 lines of filogic.mk ---"
+        tail -15 filogic.mk
+
+    - name: Copy custom DTS file
+      run: |
+        cd openwrt
+        mkdir -p target/linux/mediatek/dts
+        cp -v $GITHUB_WORKSPACE/openwrt-mod/mt7981*.dts target/linux/mediatek/dts/
+
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: .ccache
+        key: openwrt-ccache-v6-${{ runner.os }}-v25
+        restore-keys:
+          openwrt-ccache-v6-${{ runner.os }} |
+          openwrt-ccache-${{ runner.os }}
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Add iStore feed (compile-time integration)
+      run: |
+        cd openwrt
+        # 加 iStore 源到 feeds.conf.default（默认在最后）
+        echo 'src-git istore https://github.com/linkease/istore;main' >> feeds.conf.default
+        # 拉 iStore feed
+        ./scripts/feeds update istore
+        # 装 iStore LuCI 插件到 baked 镜像
+        ./scripts/feeds install -d y -p istore luci-app-store luci-lib-taskd taskd
+        echo "[OK] iStore feed installed"
+        ls feeds/istore/ | head -5
+
+    - name: Bake custom files (mirror source, LAN IP, etc.)
+      run: |
+        mkdir -p files/etc/apk/repositories.d
+        mkdir -p files/etc/config
+
+        # 1. 软件源：清华 TUNA（默认 vsean 国内常挂）
+        cat > files/etc/apk/repositories.d/distfeeds.list <<'FEEDS_EOF'
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.1/targets/mediatek/filogic/packages/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/base/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/luci/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/packages/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/routing/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/telephony/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/video/packages.adb
+        FEEDS_EOF
+
+        # 2. 网络配置：LAN 段固定 192.168.6.1，WAN DHCP
+        cat > files/etc/config/network <<'NETWORK_EOF'
+        config interface 'loopback'
+            option device 'lo'
+            option proto 'static'
+            option ipaddr '127.0.0.1'
+            option netmask '255.0.0.0'
+
+        config interface 'lan'
+            option device 'br-lan'
+            option proto 'static'
+            option ipaddr '192.168.6.1'
+            option netmask '255.255.255.0'
+            option ip6assign '60'
+
+        config interface 'wan'
+            option device 'eth0'
+            option proto 'dhcp'
+
+        config interface 'wan6'
+            option device 'eth0'
+            option proto 'dhcpv6'
+        NETWORK_EOF
+
+        # 3. 时区 + hostname（防 OpenWrt 默认 UTC）
+        cat > files/etc/config/system <<'SYSTEM_EOF'
+        config system
+            option hostname 'ImmortalWrt-TR3000'
+            option timezone 'CST-8'
+            option ttylogin '0'
+            option log_size '128'
+            option urandom_seed '0'
+            option cronloglevel '8'
+            option zram_size_mb '128'
+        SYSTEM_EOF
+
+        # 4. 默认时区数据
+        mkdir -p files/etc
+        [ -f files/etc/TZ ] || echo 'CST-8' > files/etc/TZ
+
+
+        echo "[OK] Baked files:"
+        find files -type f
+
+        # === v5 关键：首次启动脚本（uci-defaults）===
+        # 用 base64 编码传脚本内容，完全避免 YAML/shell 特殊字符问题
+        # OpenWrt 首次启动（/etc/.firstboot 存在）时自动跑一遍
+        # 直接 uboot 刷机 → 触发；sysupgrade → 不触发（保留用户配置）
+        mkdir -p files/etc/uci-defaults
+        printf '%s' 'IyEvYmluL3NoCiMgVFIzMDAwIDUxMk1CIOmmluasoeWQr+WKqCBiYWtlZCDphY3nva7mgaLlpI0KVUNJPS9iaW4vdWNpClVDSSBzZXQgbmV0d29yay5sYW4uaXBhZGRyPTE5Mi4xNjguNi4xClVDSSBzZXQgbmV0d29yay5sYW4ubmV0bWFzaz0yNTUuMjU1LjI1NS4wClVDSSBzZXQgbmV0d29yay5sYW4ucHJvdG89c3RhdGljClVDSSBzZXQgbmV0d29yay5sYW4uZGV2aWNlPWJyLWxhbgpVQ0kgc2V0IHN5c3RlbS5Ac3lzdGVtWzBdLmhvc3RuYW1lPUltbW9ydGFsV3J0LVRSMzAwMApVQ0kgc2V0IHN5c3RlbS5Ac3lzdGVtWzBdLnRpbWV6b25lPUNTVC04ClVDSSBzZXQgc3lzdGVtLkBzeXN0ZW1bMF0uem9uZW5hbWU9QXNpYS9TaGFuZ2hhaQpjYXQgPiAvZXRjL2Fway9yZXBvc2l0b3JpZXMuZC9kaXN0ZmVlZHMubGlzdCA8PEZFRURTX0VPRgpodHRwczovL21pcnJvcnMudHVuYS50c2luZ2h1YS5lZHUuY24vb3BlbndydC9yZWxlYXNlcy8yNS4xMi4xL3RhcmdldHMvbWVkaWF0ZWsvZmlsb2dpYy9wYWNrYWdlcy9wYWNrYWdlcy5hZGIKaHR0cHM6Ly9taXJyb3JzLnR1bmEudHNpbmdodWEuZWR1LmNuL29wZW53cnQvcmVsZWFzZXMvMjUuMTIuMS9wYWNrYWdlcy9hYXJjaDY0X2NvcnRleC1hNTMvYmFzZS9wYWNrYWdlcy5hZGIKaHR0cHM6Ly9taXJyb3JzLnR1bmEudHNpbmdodWEuZWR1LmNuL29wZW53cnQvcmVsZWFzZXMvMjUuMTIuMS9wYWNrYWdlcy9hYXJjaDY0X2NvcnRleC1hNTMvbHVjaS9wYWNrYWdlcy5hZGIKaHR0cHM6Ly9taXJyb3JzLnR1bmEudHNpbmdodWEuZWR1LmNuL29wZW53cnQvcmVsZWFzZXMvMjUuMTIuMS9wYWNrYWdlcy9hYXJjaDY0X2NvcnRleC1hNTMvcGFja2FnZXMvcGFja2FnZXMuYWRiCmh0dHBzOi8vbWlycm9ycy50dW5hLnRzaW5naHVhLmVkdS5jbi9vcGVud3J0L3JlbGVhc2VzLzI1LjEyLjEvcGFja2FnZXMvYWFyY2g2NF9jb3J0ZXgtYTUzL3JvdXRpbmcvcGFja2FnZXMuYWRiCmh0dHBzOi8vbWlycm9ycy50dW5hLnRzaW5naHVhLmVkdS5jbi9vcGVud3J0L3JlbGVhc2VzLzI1LjEyLjEvcGFja2FnZXMvYWFyY2g2NF9jb3J0ZXgtYTUzL3RlbGVwaG9ueS9wYWNrYWdlcy5hZGIKaHR0cHM6Ly9taXJyb3JzLnR1bmEudHNpbmdodWEuZWR1LmNuL29wZW53cnQvcmVsZWFzZXMvMjUuMTIuMS9wYWNrYWdlcy9hYXJjaDY0X2NvcnRleC1hNTMvdmlkZW8vcGFja2FnZXMuYWRiCkZFRURTX0VPRgppZiBbIC1kIC91c3Ivc2hhcmUvdWNvZGUvbHVjaS90ZW1wbGF0ZS90aGVtZXMvYXJnb24gXTsgdGhlbgogICAgVUNJIHNldCBsdWNpLm1haW4udGhlbWU9YXJnb24KZmkKVUNJIGNvbW1pdCBuZXR3b3JrClVDSSBjb21taXQgc3lzdGVtClVDSSBjb21taXQgbHVjaQpleGl0IDAK' | base64 -d > files/etc/uci-defaults/99-tr3000-baked
+        chmod +x files/etc/uci-defaults/99-tr3000-baked
+        echo "[OK] uci-defaults/99-tr3000-baked created (first-boot script)"
+
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        # 直接 inline 写入 .config（不依赖仓库里的配置文件）
+        cat > openwrt/.config <<'OPENWRT_CONFIG_EOF'
+        CONFIG_TARGET_mediatek=y
+        CONFIG_TARGET_mediatek_filogic=y
+        CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-512mb-v1=y
+        CONFIG_PACKAGE_kmod-tun=y
+        CONFIG_PACKAGE_kmod-nft-tproxy=y
+        CONFIG_PACKAGE_kmod-nft-nat=y
+        CONFIG_PACKAGE_kmod-nft-queue=y
+        CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y
+        CONFIG_PACKAGE_kmod-nf-flow-table=y
+        CONFIG_PACKAGE_kmod-ipt-conntrack-extra=y
+        CONFIG_PACKAGE_kmod-ipt-nat-extra=y
+        CONFIG_PACKAGE_kmod-ipt-physdev=y
+        CONFIG_PACKAGE_kmod-fs-ext4=y
+        CONFIG_PACKAGE_kmod-fs-vfat=y
+        CONFIG_PACKAGE_kmod-fs-exfat=y
+        CONFIG_PACKAGE_kmod-fs-ntfs3=y
+        CONFIG_PACKAGE_kmod-nls-cp437=y
+        CONFIG_PACKAGE_kmod-nls-iso8859-1=y
+        CONFIG_PACKAGE_kmod-nls-utf8=y
+        CONFIG_PACKAGE_kmod-usb-core=y
+        CONFIG_PACKAGE_kmod-usb-storage=y
+        CONFIG_PACKAGE_kmod-usb2=y
+        CONFIG_PACKAGE_kmod-usb3=y
+        CONFIG_PACKAGE_kmod-usb-serial=y
+        CONFIG_PACKAGE_kmod-crypto-aead=y
+        CONFIG_PACKAGE_kmod-crypto-hash=y
+        CONFIG_PACKAGE_kmod-crypto-rsa=y
+        CONFIG_PACKAGE_kmod-crypto-sha256=y
+        CONFIG_PACKAGE_kmod-crypto-null=y
+        CONFIG_PACKAGE_kmod-crypto-aes=y
+        CONFIG_PACKAGE_kmod-pppoe=y
+        CONFIG_PACKAGE_kmod-pptp=y
+        CONFIG_PACKAGE_kmod-pppol2tp=y
+        CONFIG_PACKAGE_kmod-thermal=y
+        CONFIG_PACKAGE_kmod-gpio-button-hotplug=y
+        CONFIG_PACKAGE_kmod-leds-gpio=y
+        CONFIG_PACKAGE_iperf3=y
+        OPENWRT_CONFIG_EOF
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Disable dev packages (prevent OOM on 7GB runner)
+      run: |
+        # .config 此时已存在（Load custom configuration 步骤创建）
+        # 把上游 config.buildinfo 里的 dev/debug 工具 =m 改成 is not set
+        cd openwrt
+        sed -i -E '
+          s/^CONFIG_PACKAGE_perf=.*/# CONFIG_PACKAGE_perf is not set/;
+          s/^CONFIG_PACKAGE_kselftests-bpf=.*/# CONFIG_PACKAGE_kselftests-bpf is not set/;
+          s/^CONFIG_PACKAGE_objdump=.*/# CONFIG_PACKAGE_objdump is not set/;
+          s/^CONFIG_PACKAGE_libbfd=.*/# CONFIG_PACKAGE_libbfd is not set/;
+          s/^CONFIG_PACKAGE_libctf=.*/# CONFIG_PACKAGE_libctf is not set/;
+          s/^CONFIG_PACKAGE_libdw=.*/# CONFIG_PACKAGE_libdw is not set/;
+          s/^CONFIG_PACKAGE_libopcodes=.*/# CONFIG_PACKAGE_libopcodes is not set/;
+          s/^CONFIG_PACKAGE_libpcap=.*/# CONFIG_PACKAGE_libpcap is not set/;
+          s/^CONFIG_PACKAGE_libtraceevent=.*/# CONFIG_PACKAGE_libtraceevent is not set/;
+          s/^CONFIG_PACKAGE_musl-fts=.*/# CONFIG_PACKAGE_musl-fts is not set/;
+          s/^CONFIG_PACKAGE_owut=.*/# CONFIG_PACKAGE_owut is not set/;
+          s/^CONFIG_PACKAGE_kmod-xdp-sockets-diag=.*/# CONFIG_PACKAGE_kmod-xdp-sockets-diag is not set/;
+          s/^CONFIG_PACKAGE_libbz2=.*/# CONFIG_PACKAGE_libbz2 is not set/;
+        ' .config
+        echo "[OK] Disabled dev/debug packages (prevents OOM on 7GB runner)"
+        # 统计真禁的包数（grep 没匹配返回 1，|| true 防止脚本退出）
+        grep -cE "^# CONFIG_PACKAGE_(perf|kselftests-bpf|objdump|libbfd|owut|libbz2) is not set" .config 2>/dev/null || true
+
+    - name: Verify target device is selected
+      run: |
+        cd openwrt
+        echo "=== Selected target devices ==="
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config
+        if ! grep -q 'CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-512mb-v1=y' .config; then
+          echo "[FAIL] cudy_tr3000-512mb-v1 not selected in .config"
+          exit 1
+        fi
+        echo "[OK] cudy_tr3000-512mb-v1 selected"
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo "Starting compilation with $(nproc) threads"
+        echo "CCACHE_DIR: $CCACHE_DIR"
+
+        if make -j$(nproc) CC="ccache gcc" CXX="ccache g++"; then
+          echo "[OK] Multi-threaded compilation succeeded"
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "[WARN] Multi-threaded compilation failed, retrying with single thread and verbose output..."
+          make -j1 V=s
+          if [ $? -eq 0 ]; then
+            echo "[OK] Single-threaded compilation succeeded"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "[FAIL] Compilation failed"
+            echo "status=failure" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        fi
+
+        echo "ccache statistics:"
+        ccache -s
+
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ImmortalWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag and notes
+      id: release
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        set -e
+        cd openwrt/bin/targets/*/*
+
+        BUILD_TIME=$(date +"%Y%m%d%H%M")
+        RELEASE_NAME="immortalwrt-${REPO_BRANCH}-${BUILD_TIME}"
+        echo "release_tag=$RELEASE_NAME" >> $GITHUB_OUTPUT
+
+        echo "Release name: $RELEASE_NAME"
+        echo "Collecting firmware files..."
+
+        FIRMWARE_FILES=$(ls *squashfs-sysupgrade.bin *initramfs-kernel.bin 2>/dev/null || true)
+        if [ -z "$FIRMWARE_FILES" ]; then
+          echo "[FAIL] No matching firmware files (*.bin) found"
+          exit 1
+        fi
+
+        echo "Generating SHA256 checksums..."
+        sha256sum $FIRMWARE_FILES > sha256sums.txt
+        echo "Firmware list:"
+        cat sha256sums.txt
+
+        {
+          echo "## ImmortalWrt ${REPO_BRANCH} for Cudy TR3000 (512MB)"
+          echo ""
+          echo "- Branch: \`${REPO_BRANCH}\`"
+          echo "- Device: \`cudy_tr3000-512mb-v1\`"
+          echo "- Build time: \`${BUILD_TIME}\`"
+          echo "- Image size: 520000k"
+          echo "- Default IP: 192.168.1.1"
+          echo ""
+          echo "### Install"
+          echo "1. Install the multi-layout u-boot first (from zhuannn/cudy-tr3000-512 releases)."
+          echo "2. In u-boot choose mtd layout \`mod-490\`."
+          echo "3. Flash \`*squashfs-sysupgrade.bin\` via u-boot or sysupgrade."
+          echo ""
+          echo "### SHA256"
+          echo ""
+          sed 's/^/    /' sha256sums.txt
+        } > ${{ github.workspace }}/release.txt
+
+        if [ "${UPLOAD_KMOD}" = "true" ]; then
+          if [ -d packages ]; then
+            tar -czf kmod.tar.gz packages
+            echo "[OK] Generated kmod.tar.gz"
+          else
+            echo "[WARN] packages directory not found, skipping kmod packaging"
+          fi
+        fi
+
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@master
+      if: steps.release.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.release.outputs.release_tag }}
+        name: ${{ steps.release.outputs.release_tag }}
+        body_path: ${{ github.workspace }}/release.txt
+        files: |
+          ${{ env.FIRMWARE_PATH }}/*squashfs-sysupgrade.bin
+          ${{ env.FIRMWARE_PATH }}/*initramfs-kernel.bin
+          ${{ env.FIRMWARE_PATH }}/kmod.tar.gz
